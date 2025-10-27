@@ -16,16 +16,94 @@ const FLUENTCRM_API_USERNAME = process.env.FLUENTCRM_API_USERNAME || '';
 const FLUENTCRM_API_PASSWORD = process.env.FLUENTCRM_API_PASSWORD || '';
 
 /**
+ * Input Validation Helpers
+ */
+function validateEmail(email: string): boolean {
+  if (!email || typeof email !== 'string') return false;
+  const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+  return emailRegex.test(email);
+}
+
+function validateId(id: any): number {
+  const numId = parseInt(id, 10);
+  if (isNaN(numId) || numId <= 0) {
+    throw new Error('Invalid ID: must be a positive integer');
+  }
+  return numId;
+}
+
+function validateUrl(url: string): boolean {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeString(str: string): string {
+  if (!str || typeof str !== 'string') return '';
+  // Remove script tags and HTML
+  return str
+    .replace(/<script[^>]*>.*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .trim()
+    .substring(0, 1000); // Limit length
+}
+
+/**
+ * Rate Limiter using Token Bucket algorithm
+ */
+class RateLimiter {
+  private tokens: number;
+  private lastRefill: number;
+  private readonly maxTokens: number;
+  private readonly refillRate: number; // tokens per second
+
+  constructor(maxTokens: number = 10, refillRate: number = 2) {
+    this.maxTokens = maxTokens;
+    this.refillRate = refillRate;
+    this.tokens = maxTokens;
+    this.lastRefill = Date.now();
+  }
+
+  private refill() {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefill) / 1000;
+    const tokensToAdd = elapsed * this.refillRate;
+    this.tokens = Math.min(this.maxTokens, this.tokens + tokensToAdd);
+    this.lastRefill = now;
+  }
+
+  async waitForToken(): Promise<void> {
+    this.refill();
+
+    if (this.tokens >= 1) {
+      this.tokens--;
+      return;
+    }
+
+    // Wait until next token available
+    const waitTime = ((1 - this.tokens) / this.refillRate) * 1000;
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+    this.tokens = 0;
+  }
+}
+
+/**
  * FluentCRM API Client
  * Based on: https://rest-api.fluentcrm.com/#introduction
  */
 class FluentCRMClient {
   private apiClient: AxiosInstance;
   private baseURL: string;
+  private rateLimiter: RateLimiter;
 
   constructor(baseURL: string, username: string, password: string) {
     this.baseURL = baseURL;
-    
+    this.rateLimiter = new RateLimiter(10, 2); // 10 req burst, 2 req/sec sustained
+
     // Basic Auth dla FluentCRM API
     const credentials = Buffer.from(`${username}:${password}`).toString('base64');
     
@@ -50,18 +128,21 @@ class FluentCRMClient {
   }
 
   // ===== SUBSCRIBERS / KONTAKTY =====
-  
+
   async listContacts(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/subscribers', { params });
     return response.data;
   }
 
   async getContact(subscriberId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get(`/subscribers/${subscriberId}`);
     return response.data;
   }
 
   async findContactByEmail(email: string) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/subscribers', {
       params: { search: email },
     });
@@ -80,16 +161,19 @@ class FluentCRMClient {
     postal_code?: string;
     [key: string]: any;
   }) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post('/subscribers', data);
     return response.data;
   }
 
   async updateContact(subscriberId: number, data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.put(`/subscribers/${subscriberId}`, data);
     return response.data;
   }
 
   async deleteContact(subscriberId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.delete(`/subscribers/${subscriberId}`);
     return response.data;
   }
@@ -97,11 +181,13 @@ class FluentCRMClient {
   // ===== TAGI =====
 
   async listTags(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/tags', { params });
     return response.data;
   }
 
   async getTag(tagId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get(`/tags/${tagId}`);
     return response.data;
   }
@@ -111,21 +197,25 @@ class FluentCRMClient {
     slug?: string;
     description?: string;
   }) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post('/tags', data);
     return response.data;
   }
 
   async updateTag(tagId: number, data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.put(`/tags/${tagId}`, data);
     return response.data;
   }
 
   async deleteTag(tagId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.delete(`/tags/${tagId}`);
     return response.data;
   }
 
   async attachTagToContact(subscriberId: number, tagIds: number[]) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post(
       `/subscribers/${subscriberId}/tags`,
       { tags: tagIds }
@@ -134,6 +224,7 @@ class FluentCRMClient {
   }
 
   async detachTagFromContact(subscriberId: number, tagIds: number[]) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post(
       `/subscribers/${subscriberId}/tags/detach`,
       { tags: tagIds }
@@ -144,11 +235,13 @@ class FluentCRMClient {
   // ===== LISTY =====
 
   async listLists(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/lists', { params });
     return response.data;
   }
 
   async getList(listId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get(`/lists/${listId}`);
     return response.data;
   }
@@ -158,21 +251,25 @@ class FluentCRMClient {
     slug?: string;
     description?: string;
   }) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post('/lists', data);
     return response.data;
   }
 
   async updateList(listId: number, data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.put(`/lists/${listId}`, data);
     return response.data;
   }
 
   async deleteList(listId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.delete(`/lists/${listId}`);
     return response.data;
   }
 
   async attachContactToList(subscriberId: number, listIds: number[]) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post(
       `/subscribers/${subscriberId}/lists`,
       { lists: listIds }
@@ -181,6 +278,7 @@ class FluentCRMClient {
   }
 
   async detachContactFromList(subscriberId: number, listIds: number[]) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post(
       `/subscribers/${subscriberId}/lists/detach`,
       { lists: listIds }
@@ -191,36 +289,43 @@ class FluentCRMClient {
   // ===== KAMPANIE =====
 
   async listCampaigns(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/campaigns', { params });
     return response.data;
   }
 
   async getCampaign(campaignId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get(`/campaigns/${campaignId}`);
     return response.data;
   }
 
   async createCampaign(data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post('/campaigns', data);
     return response.data;
   }
 
   async updateCampaign(campaignId: number, data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.put(`/campaigns/${campaignId}`, data);
     return response.data;
   }
 
   async pauseCampaign(campaignId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post(`/campaigns/${campaignId}/pause`);
     return response.data;
   }
 
   async resumeCampaign(campaignId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post(`/campaigns/${campaignId}/resume`);
     return response.data;
   }
 
   async deleteCampaign(campaignId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.delete(`/campaigns/${campaignId}`);
     return response.data;
   }
@@ -228,26 +333,31 @@ class FluentCRMClient {
   // ===== EMAIL TEMPLATES =====
 
   async listEmailTemplates(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/email-templates', { params });
     return response.data;
   }
 
   async getEmailTemplate(templateId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get(`/email-templates/${templateId}`);
     return response.data;
   }
 
   async createEmailTemplate(data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post('/email-templates', data);
     return response.data;
   }
 
   async updateEmailTemplate(templateId: number, data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.put(`/email-templates/${templateId}`, data);
     return response.data;
   }
 
   async deleteEmailTemplate(templateId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.delete(`/email-templates/${templateId}`);
     return response.data;
   }
@@ -255,26 +365,31 @@ class FluentCRMClient {
   // ===== AUTOMATION FUNNELS =====
 
   async listAutomations(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/funnels', { params });
     return response.data;
   }
 
   async getAutomation(funnelId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get(`/funnels/${funnelId}`);
     return response.data;
   }
 
   async createAutomation(data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post('/funnels', data);
     return response.data;
   }
 
   async updateAutomation(funnelId: number, data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.put(`/funnels/${funnelId}`, data);
     return response.data;
   }
 
   async deleteAutomation(funnelId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.delete(`/funnels/${funnelId}`);
     return response.data;
   }
@@ -282,6 +397,7 @@ class FluentCRMClient {
   // ===== WEBHOOKS =====
 
   async listWebhooks(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/webhooks', { params });
     return response.data;
   }
@@ -293,16 +409,19 @@ class FluentCRMClient {
     tags?: number[];
     lists?: number[];
   }) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.post('/webhook', data);
     return response.data;
   }
 
   async updateWebhook(webhookId: number, data: any) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.put(`/webhook/${webhookId}`, data);
     return response.data;
   }
 
   async deleteWebhook(webhookId: number) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.delete(`/webhook/${webhookId}`);
     return response.data;
   }
@@ -310,6 +429,7 @@ class FluentCRMClient {
   // ===== CUSTOM FIELDS =====
 
   async listCustomFields() {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/custom-fields');
     return response.data;
   }
@@ -319,6 +439,7 @@ class FluentCRMClient {
   // These methods prepare for future API or work with existing endpoints
 
   async listSmartLinks(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     // Try to get smart links - this might not work until FluentCRM adds the endpoint
     try {
       const response = await this.apiClient.get('/smart-links', { params });
@@ -341,6 +462,7 @@ class FluentCRMClient {
   }
 
   async getSmartLink(smartLinkId: number) {
+    await this.rateLimiter.waitForToken();
     try {
       const response = await this.apiClient.get(`/smart-links/${smartLinkId}`);
       return response.data;
@@ -366,6 +488,7 @@ class FluentCRMClient {
     remove_lists?: number[];
     auto_login?: boolean;
   }) {
+    await this.rateLimiter.waitForToken();
     try {
       const response = await this.apiClient.post('/smart-links', data);
       return response.data;
@@ -383,6 +506,7 @@ class FluentCRMClient {
   }
 
   async updateSmartLink(smartLinkId: number, data: any) {
+    await this.rateLimiter.waitForToken();
     try {
       const response = await this.apiClient.put(`/smart-links/${smartLinkId}`, data);
       return response.data;
@@ -399,6 +523,7 @@ class FluentCRMClient {
   }
 
   async deleteSmartLink(smartLinkId: number) {
+    await this.rateLimiter.waitForToken();
     try {
       const response = await this.apiClient.delete(`/smart-links/${smartLinkId}`);
       return response.data;
@@ -451,11 +576,13 @@ class FluentCRMClient {
   // ===== REPORTS =====
 
   async getDashboardStats() {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/reports/dashboard-stats');
     return response.data;
   }
 
   async getSubscribersGrowthRate(params: any = {}) {
+    await this.rateLimiter.waitForToken();
     const response = await this.apiClient.get('/reports/subscribers-growth-rate', { params });
     return response.data;
   }
@@ -944,22 +1071,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case 'fluentcrm_list_contacts':
         return { content: [{ type: 'text', text: JSON.stringify(await client.listContacts(args || {}), null, 2) }] };
-      case 'fluentcrm_get_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getContact((args as any)?.subscriberId), null, 2) }] };
-      case 'fluentcrm_find_contact_by_email':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.findContactByEmail((args as any)?.email), null, 2) }] };
-      case 'fluentcrm_create_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createContact(args as any), null, 2) }] };
-      case 'fluentcrm_update_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.updateContact((args as any)?.subscriberId, args as any), null, 2) }] };
-      case 'fluentcrm_delete_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteContact((args as any)?.subscriberId), null, 2) }] };
+      case 'fluentcrm_get_contact': {
+        const subscriberId = validateId((args as any)?.subscriberId);
+        return { content: [{ type: 'text', text: JSON.stringify(await client.getContact(subscriberId), null, 2) }] };
+      }
+      case 'fluentcrm_find_contact_by_email': {
+        const email = (args as any)?.email;
+        if (!validateEmail(email)) {
+          throw new Error('Invalid email address format');
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(await client.findContactByEmail(email), null, 2) }] };
+      }
+      case 'fluentcrm_create_contact': {
+        const data = args as any;
+        if (!validateEmail(data?.email)) {
+          throw new Error('Invalid email address format');
+        }
+        // Sanitize string fields
+        if (data.first_name) data.first_name = sanitizeString(data.first_name);
+        if (data.last_name) data.last_name = sanitizeString(data.last_name);
+        if (data.address_line_1) data.address_line_1 = sanitizeString(data.address_line_1);
+        if (data.city) data.city = sanitizeString(data.city);
+        return { content: [{ type: 'text', text: JSON.stringify(await client.createContact(data), null, 2) }] };
+      }
+      case 'fluentcrm_update_contact': {
+        const subscriberId = validateId((args as any)?.subscriberId);
+        const data = args as any;
+        if (data.first_name) data.first_name = sanitizeString(data.first_name);
+        if (data.last_name) data.last_name = sanitizeString(data.last_name);
+        return { content: [{ type: 'text', text: JSON.stringify(await client.updateContact(subscriberId, data), null, 2) }] };
+      }
+      case 'fluentcrm_delete_contact': {
+        const subscriberId = validateId((args as any)?.subscriberId);
+        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteContact(subscriberId), null, 2) }] };
+      }
       case 'fluentcrm_list_tags':
         return { content: [{ type: 'text', text: JSON.stringify(await client.listTags(args || {}), null, 2) }] };
-      case 'fluentcrm_create_tag':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createTag(args as any), null, 2) }] };
-      case 'fluentcrm_delete_tag':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteTag((args as any)?.tagId), null, 2) }] };
+      case 'fluentcrm_create_tag': {
+        const data = args as any;
+        if (data.title) data.title = sanitizeString(data.title);
+        if (data.description) data.description = sanitizeString(data.description);
+        return { content: [{ type: 'text', text: JSON.stringify(await client.createTag(data), null, 2) }] };
+      }
+      case 'fluentcrm_delete_tag': {
+        const tagId = validateId((args as any)?.tagId);
+        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteTag(tagId), null, 2) }] };
+      }
       case 'fluentcrm_attach_tag_to_contact':
         return { content: [{ type: 'text', text: JSON.stringify(await client.attachTagToContact((args as any)?.subscriberId, (args as any)?.tagIds), null, 2) }] };
       case 'fluentcrm_detach_tag_from_contact':
@@ -994,8 +1151,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify(await client.createAutomation(args as any), null, 2) }] };
       case 'fluentcrm_list_webhooks':
         return { content: [{ type: 'text', text: JSON.stringify(await client.listWebhooks(), null, 2) }] };
-      case 'fluentcrm_create_webhook':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createWebhook(args as any), null, 2) }] };
+      case 'fluentcrm_create_webhook': {
+        const data = args as any;
+        if (!validateUrl(data?.url)) {
+          throw new Error('Invalid webhook URL format (must be http:// or https://)');
+        }
+        if (data.name) data.name = sanitizeString(data.name);
+        return { content: [{ type: 'text', text: JSON.stringify(await client.createWebhook(data), null, 2) }] };
+      }
       case 'fluentcrm_dashboard_stats':
         return { content: [{ type: 'text', text: JSON.stringify(await client.getDashboardStats(), null, 2) }] };
       case 'fluentcrm_custom_fields':
@@ -1032,8 +1195,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('🚀 FluentCRM MCP Server running on stdio');
-  console.error(`📡 API URL: ${FLUENTCRM_API_URL}`);
-  console.error(`👤 Username: ${FLUENTCRM_API_USERNAME}`);
+  console.error('✅ Credentials configured via environment variables');
 }
 
 main().catch((error) => {
